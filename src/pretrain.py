@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pandas.io.stata import excessive_string_length_error
 
+from src.generator import Generator
+from src.set_encoder import SetEncoder
 from tokenizer import FormulaTokenizer
 from metrics import FormulaDistanceMetric
 
@@ -44,11 +47,9 @@ class CacheDataset(Dataset):
 def generate_and_save_data(
         generator,
         metric_calculator,
-        tokenizer,  # [新增] 需要 tokenizer 把公式转成 ID
-        alpha,
         cache_size,
-        sample_num,
-        save_path=None  # [新增] 保存路径
+        save_path=None,  # [新增] 保存路径
+        target_dim = 16
 ):
     """
     生成数据，计算相似度，并Token化公式。
@@ -65,49 +66,50 @@ def generate_and_save_data(
     list_f2_tokens = []
 
     print(f"Generating data ({cache_size} samples)...")
-    for _ in tqdm(range(cache_size)):
-        # 1. 生成 Anchor (Query)
-        f_base = generator.sample_formula()
-        x1, y1 = f_base.sample(sample_num)
+    i = 0
+    while i < cache_size:
 
-        # 2. 生成 Comparison (Context / Retrieved)
-        rand = np.random.rand()
-        if rand < 0.25:
-            f_target = f_base  # Dist=0
-            x2, y2 = f_base.sample(sample_num)
-        elif rand < 0.50:
-            f_target = generator.mutate_formula(f_base, edits=1)
-            x2, y2 = f_target.sample(sample_num)
-        elif rand < 0.75:
-            f_target = generator.mutate_formula(f_base, edits=3)
-            x2, y2 = f_target.sample(sample_num)
-        else:
-            f_target = generator.sample_formula()
-            x2, y2 = f_target.sample(sample_num)
+        try:
 
-        # 3. 计算 Target Similarity (用于 SetEncoder)
-        base_prefix = f_base.to_prefix_tokens()
-        target_prefix = f_target.to_prefix_tokens()
+            # 1. 生成 Anchor (Query)
+            x_f, y_f, f_expr, f, f_id, input_dimension, org_tree = generator.sample_formula()
+            x_padded = np.zeros((x_f.shape[0], target_dim), dtype=np.float32)
+            x_padded[:, :x_f.shape[1]] = x_f
+            x_f = x_padded
 
-        raw_dist = metric_calculator.compute_distance(base_prefix, target_prefix)
-        target_sim = np.exp(-alpha * raw_dist)
+            # 2. 生成 Comparison (Context / Retrieved)
+            rand = np.random.rand()
+            if rand < 0.15:
+                x_g, y_g, g_expr, g, g_id, g_input_dimension, g_org_tree = x_f, y_f, f_expr, f, f_id, input_dimension, org_tree
+                x_g, y_g = generator.resample_formula(org_tree, input_dimension)
+            elif rand < 0.3:
+                x_g, y_g, g_expr, g, g_id, g_input_dimension, g_org_tree = generator.mutate_formula(f, input_dimension, org_tree, edit=3)
+            elif rand < 0.5:
+                x_g, y_g, g_expr, g, g_id, g_input_dimension, g_org_tree = generator.mutate_formula(f, input_dimension, org_tree, edit=5)
+            else:
+                x_g, y_g, g_expr, g, g_id, g_input_dimension, g_org_tree = generator.sample_formula()
 
-        # 4. [新增] Token化公式 (用于 TabPFN)
-        # tokenizer.encode 会自动处理 Padding, SOS, EOS, Truncation
-        # 返回的是 List[int]
-        f1_ids = tokenizer.encode(base_prefix)
-        f2_ids = tokenizer.encode(target_prefix)
+            x_padded = np.zeros((x_g.shape[0], target_dim), dtype=np.float32)
+            x_padded[:, :x_g.shape[1]] = x_g
+            x_g = x_padded
 
-        # Append to lists
-        list_x1.append(x1)
-        list_y1.append(y1)
-        list_x2.append(x2)
-        list_y2.append(y2)
-        list_target_sims.append(target_sim)
+            target_sim = metric_calculator.compute_similarity(f_expr, g_expr)
 
-        # 转为 Tensor 并存入列表 (LongTensor)
-        list_f1_tokens.append(torch.tensor(f1_ids, dtype=torch.long))
-        list_f2_tokens.append(torch.tensor(f2_ids, dtype=torch.long))
+            # Append to lists
+            list_x1.append(torch.tensor(x_f, dtype=torch.float32))
+            list_y1.append(torch.tensor(y_f, dtype=torch.float32))
+            list_x2.append(torch.tensor(x_g, dtype=torch.float32))
+            list_y2.append(torch.tensor(y_g, dtype=torch.float32))
+            list_target_sims.append(target_sim)
+
+            # 转为 Tensor 并存入列表 (LongTensor)
+            list_f1_tokens.append(torch.tensor(f_id, dtype=torch.long))
+            list_f2_tokens.append(torch.tensor(g_id, dtype=torch.long))
+            # print(f'Dataset {i} generated!')
+            i += 1
+
+        except:
+            pass
 
     # 5. 统一堆叠 (Stack)
     data_dict = {
@@ -179,7 +181,7 @@ class StructureMetricTrainer:
             y1 = batch['y1'].to(self.device)
             x2 = batch['x2'].to(self.device)
             y2 = batch['y2'].to(self.device)
-            targets = batch['target'].to(self.device)
+            targets = batch['target_sim'].to(self.device)
 
             # 2. 清空梯度
             self.optimizer.zero_grad()
@@ -189,6 +191,9 @@ class StructureMetricTrainer:
             emb2 = F.normalize(self.model(x2, y2), p=2, dim=1)
 
             pred_sims = (emb1 * emb2).sum(dim=1)
+
+            # print(pred_sims)
+            # print(targets)
 
             # 4. Backward
             loss = self.mse_loss(pred_sims, targets)
@@ -204,50 +209,110 @@ class StructureMetricTrainer:
 
         return total_loss / count
 
-    def run_training_loop(self, generator, num_cycles=100, cache_size=10000, epochs_per_cycle=20):
+    def run_training_loop(self, generator, num_files=10, cache_size=1000, total_epochs=50):
         """
-        主训练循环
         Args:
             generator: 公式生成器
-            num_cycles: 总共进行多少次 "生成-训练" 循环
-            cache_size: 每次循环生成的样本数量 (比如 10,000)
-            epochs_per_cycle: 每批数据训练几个 Epoch (通常 1 次就够了，避免过拟合这批特定数据)
+            num_files: 总共生成多少个 dataset 文件 (相当于总数据集大小 = num_files * cache_size)
+            cache_size: 每个文件包含多少个样本
+            total_epochs: 遍历所有文件的次数
         """
-        print(f"Start Training: {num_cycles} cycles, {cache_size} samples per cycle.")
 
-        for cycle in range(num_cycles):
-            dataset_path = os.path.join(self.save_path, f"dataset_generated_{num_cycles}")
-            if not os.path.exists(dataset_path):
-                os.makedirs(dataset_path)
+        # === Phase 1: 数据预生成 (Offline Generation) ===
+        data_dir = os.path.join(self.save_path, "pregenerated_data")
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir)
 
-            print(f"\n=== Cycle {cycle + 1}/{num_cycles} ===")
+        print(f"=== Phase 1: Generating {num_files} dataset files... ===")
+        generated_files = []
 
-            # 1. 在线生成数据集 (CPU)
-            raw_data = generate_and_save_data(
+        for i in range(num_files):
+            # [修复] 文件名带上索引，避免覆盖
+            file_name = f"dataset_{i}.pt"
+            file_path = os.path.join(data_dir, file_name)
+            generated_files.append(file_path)
+
+            if os.path.exists(file_path):
+                print(f"File {file_name} already exists. Skipping generation.")
+                continue
+
+            # 调用生成函数
+            generate_and_save_data(
                 generator=generator,
                 metric_calculator=self.metric,
-                alpha=self.alpha,
                 cache_size=cache_size,
-                sample_num=self.sample_num,
-                save_path=os.path.join(dataset_path, "dataset.pt"),
-                tokenizer=self.tokenizer
+                save_path=file_path,
+                target_dim=16
             )
+            print(f"Generated {i + 1}/{num_files}: {file_name}")
 
-            # 2. 封装成 Dataset 和 DataLoader
-            dataset = CacheDataset(raw_data)
-            dataloader = DataLoader(
-                dataset,
-                batch_size=self.batch_size,
-                shuffle=True,  # 打乱这批数据
-                num_workers=4,  # 开启多进程加速数据传输
-                pin_memory=True  # 加速 CPU -> GPU 传输
-            )
+        print("=== Data Generation Complete. Starting Training... ===")
 
-            # 3. 训练 (GPU)
-            for epoch in range(epochs_per_cycle):
-                avg_loss = self.train_epoch(dataloader)
-                print(f"   Epoch {epoch + 1}: Loss = {avg_loss:.6f}")
+        # === Phase 2: 迭代训练 (Iterative Training) ===
+        # 逻辑：每个 Epoch 都要遍历所有的文件
 
-            # 4. (可选) 保存 Checkpoint
-            if (cycle + 1) % 10 == 0:
-                torch.save(self.model.state_dict(), f"set_encoder_cycle_{cycle + 1}.pth")
+        for epoch in range(total_epochs):
+            print(f"\n>>> Global Epoch {epoch + 1}/{total_epochs}")
+
+            epoch_loss = 0
+            file_count = 0
+
+            # [优化] 每个 Epoch 开始前打乱文件读取顺序，增加随机性
+            # 类似于 Shuffle
+            np.random.shuffle(generated_files)
+
+            # 遍历每一个文件
+            for file_path in generated_files:
+                # 1. 加载当前文件
+                # 这里的 IO 可能会成为瓶颈，如果是 SSD 没问题
+                # 如果是 HDD，可以使用 torch.utils.data.ChainDataset 或者预加载下个文件
+                dataset = CacheDataset(file_path)
+
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=self.batch_size,
+                    shuffle=True,  # 文件内部打乱
+                    num_workers=0,  # Mac 上用 0 可能更稳，Linux 用 4
+                    pin_memory=True
+                )
+
+                # 2. 训练这个文件 (只训练 1 次！不要在这里多 Epoch)
+                # 我们希望模型快速看一遍这个文件，然后去看下一个文件
+                # 这样可以保持梯度的多样性
+                loss = self.train_epoch(dataloader)
+                epoch_loss += loss
+                file_count += 1
+
+                # print(f"   Processed {os.path.basename(file_path)} | Loss: {loss:.4f}")
+
+            avg_epoch_loss = epoch_loss / file_count
+            print(f"   [Epoch {epoch + 1} Summary] Avg Loss: {avg_epoch_loss:.6f}")
+
+            # 3. 保存 Checkpoint
+            if (epoch + 1) % 5 == 0:
+                ckpt_name = f"set_encoder_epoch_{epoch + 1}.pth"
+                torch.save(self.model.state_dict(), os.path.join(self.save_path, ckpt_name))
+                print(f"   Checkpoint saved: {ckpt_name}")
+
+
+if __name__ == "__main__":
+    # 1. 初始化
+    generator = Generator()  # 你的生成器已经包含了 RandomState 的修复
+    set_encoder = SetEncoder(num_x_features=16)
+
+    # 2. 选择设备 (Mac M系列)
+    device = 'cpu'
+    print(f"Training on {device}")
+
+    # 3. 初始化 Trainer
+    trainer = StructureMetricTrainer(set_encoder=set_encoder, device=device)
+
+    # 4. 开始流程
+    # 假设我们生成 50 个文件，每个文件 2000 个样本 => 总共 10万数据
+    # 训练 100 个 Epoch
+    trainer.run_training_loop(
+        generator=generator,
+        num_files=10,  # 生成 50 个不同的文件
+        cache_size=100,  # 每个文件 2000 条数据
+        total_epochs=100  # 总共把这 50 个文件过 100 遍
+    )

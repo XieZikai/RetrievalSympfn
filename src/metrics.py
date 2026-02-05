@@ -24,8 +24,8 @@ class FormulaDistanceMetric:
         """
         # 如果输入是 Token 字符串列表，先转 ID
         if seq1 and isinstance(seq1[0], str):
-            seq1 = self.tokenizer.encode(seq1)  # 假设 encode 返回 ID list
-            seq2 = self.tokenizer.encode(seq2)
+            seq1 = self.tokenizer.encode_raw(seq1)  # 假设 encode 返回 ID list
+            seq2 = self.tokenizer.encode_raw(seq2)
 
         # 移除 SOS/EOS/PAD 对结构比较的影响 (可选，但推荐)
         # 假设 tokenizer.encode 加上了 SOS(idx 1) 和 EOS(idx 2)

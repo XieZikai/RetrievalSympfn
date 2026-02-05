@@ -1,145 +1,165 @@
 import ast
 import re
 
-import ast
-import re
+# ================= 配置区 =================
+UNARY_OPS = {
+    'abs', 'inv', 'sqrt', 'log', 'log2', 'log10', 'exp',
+    'sin', 'asin', 'sinh', 'asinh',
+    'cos', 'acos', 'cosh', 'acosh',
+    'tan', 'atan', 'tanh', 'atanh',
+    'pow2', 'pow3', 'sign', 'neg'
+}
 
-import ast
-import re
+BINARY_OPS = {
+    'add', 'sub', 'mul', 'div', 'min', 'max', 'pow'
+}
+
+COMMUTATIVE_OPS = {'add', 'mul', 'max', 'min'}
+
+MATH_CONSTANTS = {'e', 'pi', 'euler_gamma'}
 
 
 class ExpressionConverter:
     def __init__(self):
-        # 1. 字符串替换策略 (The Hack)
-        # 我们利用 Python 的位运算符来“借尸还魂”
-        # max -> | (BitOr)
-        # min -> & (BitAnd)
-        # 这样 (a max b) 变成 (a | b)，Python AST 就能解析了！
+        # [核心修改] 使用正则 Lookahead (?!\()
+        # 意思：匹配单词 "add"，但仅当它后面"不是"左括号时才替换
+        # 这样 add(a,b) 会保持原样，而 a add b 会变成 a + b
         self.str_replacements = [
-            (r'\badd\b', '+'),
-            (r'\bsub\b', '-'),
-            (r'\bmul\b', '*'),
-            (r'\bdiv\b', '/'),
-            (r'\bmax\b', '|'),  # <--- 关键修改
-            (r'\bmin\b', '&'),  # <--- 关键修改
+            (r'\badd\s*(?!\()', '+'),
+            (r'\bsub\s*(?!\()', '-'),
+            (r'\bmul\s*(?!\()', '*'),
+            (r'\bdiv\s*(?!\()', '/'),
+            (r'\bmax\s*(?!\()', '|'),  # max -> BitOr
+            (r'\bmin\s*(?!\()', '&'),  # min -> BitAnd
+            (r'\bpow\s*(?!\()', '**'),  # pow -> Pow
         ]
 
-        # 2. AST 节点映射
         self.op_map = {
             ast.Add: 'add',
             ast.Sub: 'sub',
             ast.Mult: 'mul',
             ast.Div: 'div',
             ast.Pow: 'pow',
-            ast.BitOr: 'max',  # <--- 还原 max
-            ast.BitAnd: 'min',  # <--- 还原 min
+            ast.BitOr: 'max',  # 还原 |
+            ast.BitAnd: 'min',  # 还原 &
         }
 
-        # 3. 交换律集合 (max 和 min 也满足交换律)
-        self.commutative_ops = {'add', 'mul', 'max', 'min'}
-
     def _preprocess_string(self, expr_str):
+        # 预处理：应用智能替换
         for pattern, repl in self.str_replacements:
             expr_str = re.sub(pattern, repl, expr_str)
         return expr_str
 
     def _ast_to_prefix(self, node):
-        # --- Case A: 二元运算 (BinOp) ---
+        # --- Case A: 二元运算 (BinOp: a + b 或 a | b) ---
         if isinstance(node, ast.BinOp):
+            # [特殊处理] (x)**2 -> pow2(x), (x)**3 -> pow3(x)
+            if isinstance(node.op, ast.Pow) and isinstance(node.right, (ast.Num, ast.Constant)):
+                val = node.right.n if isinstance(node.right, ast.Num) else node.right.value
+                if val == 2:
+                    return ['pow2'] + self._ast_to_prefix(node.left)
+                elif val == 3:
+                    return ['pow3'] + self._ast_to_prefix(node.left)
+
             op_type = type(node.op)
             op_token = self.op_map.get(op_type, 'unknown_op')
 
             left_seq = self._ast_to_prefix(node.left)
             right_seq = self._ast_to_prefix(node.right)
 
-            # 结构规范化：交换律算子排序
-            if op_token in self.commutative_ops:
-                left_str = " ".join(left_seq)
-                right_str = " ".join(right_seq)
-                if left_str > right_str:
-                    return [op_token] + right_seq + left_seq
+            return self._finalize_binary_op(op_token, left_seq, right_seq)
 
-            return [op_token] + left_seq + right_seq
+        # --- Case B: 函数调用 (Call: add(a, b)) ---
+        elif isinstance(node, ast.Call):
+            func_name = node.func.id
+            args_seq_list = [self._ast_to_prefix(arg) for arg in node.args]
+
+            # 如果函数是二元且可交换 (如 max(a,b))，进行排序
+            if func_name in COMMUTATIVE_OPS and len(args_seq_list) == 2:
+                left_seq = args_seq_list[0]
+                right_seq = args_seq_list[1]
+                return self._finalize_binary_op(func_name, left_seq, right_seq)
+
+            # 普通函数
+            flat_args = []
+            for seq in args_seq_list:
+                flat_args.extend(seq)
+            return [func_name] + flat_args
 
         # --- Case C: 常数 ---
         elif isinstance(node, (ast.Constant, ast.Num)):
             return ['<C>']
 
-        # --- Case D: 变量 ---
+        # --- Case D: 变量 & 数学常数 ---
         elif isinstance(node, ast.Name):
+            if node.id in MATH_CONSTANTS:
+                # [修改] 保留原名，不要返回 ['<C>']
+                return [node.id]
             return [node.id]
 
         # --- Case E: 一元运算 ---
         elif isinstance(node, ast.UnaryOp):
             if isinstance(node.op, ast.USub):
-                return self._ast_to_prefix(node.operand)
-            # 处理 inv (倒数) -> 假设映射为 Python 的 ~ (Invert) 或者其他
-            # 如果你的数据里有 'inv(...)' 这种写法，它会被解析为 ast.Call 而不是 UnaryOp
-            # 如果是 'neg ...' 这种，看情况
+                if isinstance(node.operand, (ast.Num, ast.Constant)):
+                    return ['<C>']  # -5 -> <C>
+                return ['neg'] + self._ast_to_prefix(node.operand)  # -x -> neg x
             return ['unknown_unary'] + self._ast_to_prefix(node.operand)
-
-        # --- Case F: 函数调用 (你的数据里有 sqrt, inv 等) ---
-        elif isinstance(node, ast.Call):
-            func_name = node.func.id
-            args_seq = []
-            for arg in node.args:
-                args_seq.extend(self._ast_to_prefix(arg))
-            # 函数参数通常不排序，除非你也想让 sqrt(x) 和 sqrt(y) 排序
-            # 但 inv, sqrt 都是一元函数，不需要排序
-            return [func_name] + args_seq
 
         else:
             raise ValueError(f"Unsupported AST node type: {type(node)}")
+
+    def _finalize_binary_op(self, op_token, left_seq, right_seq):
+        """辅助排序"""
+        if op_token in COMMUTATIVE_OPS:
+            left_str = " ".join(left_seq)
+            right_str = " ".join(right_seq)
+            if left_str > right_str:
+                return [op_token] + right_seq + left_seq
+        return [op_token] + left_seq + right_seq
 
     def convert(self, raw_expression):
         clean_expr = self._preprocess_string(raw_expression)
         try:
             tree = ast.parse(clean_expr, mode='eval')
         except SyntaxError as e:
-            print(f"预处理后的字符串: {clean_expr}")
-            raise ValueError(f"解析失败: {e}")
-
-        prefix_seq = self._ast_to_prefix(tree.body)
-        return prefix_seq
+            # 打印出替换后的字符串，方便调试
+            raise ValueError(f"解析失败: {e} | 原始输入: {raw_expression} | 替换后: {clean_expr}")
+        return self._ast_to_prefix(tree.body)
 
 
 class StructureCanonicalizer:
     def __init__(self):
-        # 满足交换律的算子
-        self.commutative_ops = {'add', 'mul'}
+        pass
 
     def get_canonical_skeleton(self, expression_list):
-        """
-        入口: 输入前缀列表，例如 ['add', 'x_1', 'x_0']
-        输出: 规范化字符串 "add x_0 x_1"
-        """
-        # 1. 解析成树结构 (递归)
         tree, _ = self._parse(expression_list, 0)
-
-        # 2. 规范化并转字符串
-        return self._canonicalize_node(tree)
+        return self._canonicalize_node(tree).split(' ')
 
     def _parse(self, tokens, idx):
-        """简单的递归解析器"""
         if idx >= len(tokens):
-            raise ValueError("Unexpected end of expression. Structrue might be invalid.")
+            raise ValueError(f"Unexpected end of expression. Tokens: {tokens}")
 
         token = tokens[idx]
         idx += 1
 
-        # A. 变量 (x_0 ... x_15)
         if token.startswith('x_'):
             return {'type': 'var', 'val': token}, idx
 
-        # B. [修改点] 常数
-        # 这里必须同时支持 原始数字字符串 和 已经被替换过的 '<C>'
-        if token == '<C>' or self._is_number(token):
-            return {'type': 'const', 'val': token}, idx
+        # B. [修改] 数学常数 (视为特殊叶子节点)
+        if token in MATH_CONSTANTS:
+            # 这里的 type 可以叫 'math_const' 也可以混入 'op' (arity=0)，看你喜好
+            # 建议给个独立 type 以便后续处理
+            return {'type': 'math_const', 'val': token}, idx
 
-        # C. 算子
-        # 假设都是二元算子，除了 sin/cos/exp/log/sqrt 是的一元算子
-        # 注意：pow 是二元算子 (**)，会走 else 分支，这也是正确的
-        arity = 1 if token in ['sin', 'cos', 'exp', 'log', 'sqrt', 'tan', 'abs', 'max', 'min'] else 2
+        if token == '<C>' or self._is_number(token) or token in MATH_CONSTANTS:
+            return {'type': 'const', 'val': '<C>'}, idx
+
+        if token in UNARY_OPS:
+            arity = 1
+        elif token in BINARY_OPS:
+            arity = 2
+        else:
+            arity = 2
 
         children = []
         for _ in range(arity):
@@ -149,24 +169,19 @@ class StructureCanonicalizer:
         return {'type': 'op', 'val': token, 'children': children}, idx
 
     def _canonicalize_node(self, node):
-        # 1. 忽略常数：所有数字变成统一的 <C>
         if node['type'] == 'const':
             return '<C>'
-
-        # 2. 变量：直接返回 x_i
         if node['type'] == 'var':
             return node['val']
+        # [新增] 数学常数直接返回名字
+        if node['type'] == 'math_const':
+            return node['val']
 
-        # 3. 递归处理子节点
         children_strs = [self._canonicalize_node(child) for child in node['children']]
 
-        # 4. === 核心逻辑：排序 ===
-        # 如果是加法或乘法，必须对子节点的字符串表示进行排序
-        # 这自动涵盖了你说的 "x_0 在 x_1 前"，也涵盖了复杂子树的排序
-        if node['val'] in self.commutative_ops:
+        if node['val'] in COMMUTATIVE_OPS:
             children_strs.sort()
 
-            # 5. 拼接返回
         return f"{node['val']} " + " ".join(children_strs)
 
     def _is_number(self, s):
@@ -177,36 +192,55 @@ class StructureCanonicalizer:
             return False
 
 
+# ================= 测试 =================
 if __name__ == "__main__":
-    # --- 测试 ---
+    converter = ExpressionConverter()
     canon = StructureCanonicalizer()
 
-    # Case 1: 简单变量交换 (你提到的情况)
-    # x_1 + x_0 -> x_0 + x_1
-    expr1 = ['add', 'x_1', 'x_0']
-    print(f"Case 1: {canon.get_canonical_skeleton(expr1)}")
-    # 输出: add x_0 x_1 (正确)
+    print("=== 数学常数 & 规范化测试 ===\n")
 
-    # Case 2: 复杂嵌套 (必须比较子树字符串的情况)
-    # (x_0 * x_2) + (x_0 * x_1)
-    # 原始前缀: add mul x_0 x_2 mul x_0 x_1
-    expr2 = ['add', 'mul', 'x_0', 'x_2', 'mul', 'x_0', 'x_1']
-    print(f"Case 2: {canon.get_canonical_skeleton(expr2)}")
-    # 输出: add mul x_0 x_1 mul x_0 x_2
-    # (正确！它发现了 mul x_0 x_1 应该排在 mul x_0 x_2 前面)
+    test_cases = [
+        # Case 1: 基础常数识别 (pi)
+        # 预期: pi 被转为 <C>，且 <C> (ASCII 60) 排在 x_0 (ASCII 120) 前面
+        # Raw: add(x_0, pi) -> Token: [add, x_0, <C>] -> Sort: add <C> x_0
+        "add(x_0, pi)",
 
-    converter = ExpressionConverter()
+        # Case 2: 欧拉常数 (e) 与乘法
+        # 预期: e -> <C>, add(x_1, x_0) -> add x_0 x_1
+        # mul(e, ...) -> mul <C> add x_0 x_1
+        "mul(e, add(x_1, x_0))",
 
-    # 你的原始数据
-    raw_data = "(-0.352 add (cos((-2.07 add (-1.32 mul x_0))) mul ((88.0 add (2.04 mul x_1)))**3))"
+        # Case 3: 欧拉-马歇罗尼常数 (euler_gamma)
+        # 预期: euler_gamma -> <C>
+        # sub 不是交换律算子，顺序保持不变: sub <C> x_2
+        "sub(euler_gamma, x_2)",
 
-    print(f"原始输入: {raw_data}\n")
+        # Case 4: 嵌套结构排序
+        # 内部: add(pi, x_1) -> add <C> x_1
+        # 外部: add(x_0, 内部)
+        # 比较: "x_0" vs "add <C> x_1"
+        # 字符串序: "a"(add) < "x"(x_0)，所以内部结构排在前面
+        # 结果: add add <C> x_1 x_0
+        "add(x_0, add(pi, x_1))",
 
-    result = converter.convert(raw_data)
-    print(f"转换结果 (Token List): {result}")
-    print(f"转换结果 (String): {' '.join(result)}")
+        # Case 5: 混合数字和数学常数
+        # 3.14 -> <C>, pi -> <C>
+        # 结果: add <C> <C> (顺序取决于 converter 解析顺序，通常由原始顺序决定，除非完全一样)
+        # 注意: 如果两个子节点规范化后字符串完全一样(都是 <C>)，排序不改变相对位置
+        "add(3.14, pi)",
 
-    # 验证是否包含了 <C>
-    print(f"\n包含 <C> 数量: {result.count('<C>')}")
+        # Case 6: 复杂函数中的常数
+        # pow(pi, x_0) -> pow <C> x_0 (pow 不可交换)
+        "pow(pi, x_0)"
+    ]
 
-    print(f"\n转换为canonical：{canon.get_canonical_skeleton(result)}")
+    for i, raw in enumerate(test_cases, 1):
+        print(f"Case {i}: {raw}")
+        try:
+            tokens = converter.convert(raw)
+            skel = canon.get_canonical_skeleton(tokens)
+            print(f"  Tokens: {tokens}")
+            print(f"  Canon : {skel}")
+        except Exception as e:
+            print(f"  Error : {e}")
+        print("-" * 30)
