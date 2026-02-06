@@ -313,6 +313,6 @@ if __name__ == "__main__":
     trainer.run_training_loop(
         generator=generator,
         num_files=10,  # 生成 50 个不同的文件
-        cache_size=100,  # 每个文件 2000 条数据
+        cache_size=100,  # 每个文件 100 条数据
         total_epochs=100  # 总共把这 50 个文件过 100 遍
     )

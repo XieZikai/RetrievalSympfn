@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 import os
-from retrieve_sympfn.set_encoder import SetEncoder
+from src.set_encoder import SetEncoder
 
 
 ##################用来加载x和y的函数##################
