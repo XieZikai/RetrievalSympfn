@@ -12,7 +12,18 @@ import os
 import numpy as np
 from tqdm import tqdm  # 推荐安装 tqdm 显示生成进度
 from torch.utils.data import Dataset, DataLoader
+import logging  # <--- 1. 导入
+from logging import getLogger
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.FileHandler("train.log", mode="w"),
+        logging.StreamHandler()
+    ])
+logger = getLogger(__name__)
 
 class CacheDataset(Dataset):
     def __init__(self, data_source):
@@ -20,7 +31,7 @@ class CacheDataset(Dataset):
         data_source: 可以是内存中的 dict，也可以是硬盘上的 .pt 文件路径
         """
         if isinstance(data_source, str):
-            print(f"Loading data from {data_source}...")
+            logger.info(f"Loading data from {data_source}...")
             self.data = torch.load(data_source)
         else:
             self.data = data_source
@@ -65,7 +76,7 @@ def generate_and_save_data(
     list_f1_tokens = []
     list_f2_tokens = []
 
-    print(f"Generating data ({cache_size} samples)...")
+    logger.info(f"Generating data ({cache_size} samples)...")
     i = 0
     while i < cache_size:
 
@@ -129,7 +140,7 @@ def generate_and_save_data(
         # 确保目录存在
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         torch.save(data_dict, save_path)
-        print(f"Data saved to {save_path}")
+        logger.info(f"Data saved to {save_path}")
 
     return data_dict
 
@@ -145,13 +156,14 @@ class StructureMetricTrainer:
                  max_length=103,
                  batch_size=256,  # 训练时的 Batch Size
                  sample_num=100,
-                 save_path='../training_data'
+                 save_path='../training_data',
+                 resume_ckpt=None
                  ):
-
+        self.resume_ckpt = resume_ckpt
         self.tokenizer = FormulaTokenizer(max_variables=max_variables, max_length=max_length)
         self.metric = FormulaDistanceMetric(self.tokenizer)
-        self.model = set_encoder
         self.device = device
+        self.model = set_encoder.to(self.device)##加载了device
         self.batch_size = batch_size
         self.sample_num = sample_num
         self.alpha = alpha
@@ -209,6 +221,27 @@ class StructureMetricTrainer:
 
         return total_loss / count
 
+    def save_checkpoint(self, epoch, path):
+        torch.save(
+            {
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+           },
+          path
+       )
+
+    def load_checkpoint(self, path):
+        checkpoint = torch.load(path, map_location=self.device)
+
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        start_epoch = checkpoint["epoch"] + 1
+        logger.info(f"[Resume] Loaded checkpoint from epoch {checkpoint['epoch']}")
+        return start_epoch
+
+
     def run_training_loop(self, generator, num_files=10, cache_size=1000, total_epochs=50):
         """
         Args:
@@ -223,7 +256,7 @@ class StructureMetricTrainer:
         if not os.path.exists(data_dir):
             os.makedirs(data_dir)
 
-        print(f"=== Phase 1: Generating {num_files} dataset files... ===")
+        logger.info(f"=== Phase 1: Generating {num_files} dataset files... ===")
         generated_files = []
 
         for i in range(num_files):
@@ -233,7 +266,7 @@ class StructureMetricTrainer:
             generated_files.append(file_path)
 
             if os.path.exists(file_path):
-                print(f"File {file_name} already exists. Skipping generation.")
+                logger.info(f"File {file_name} already exists. Skipping generation.")
                 continue
 
             # 调用生成函数
@@ -244,15 +277,19 @@ class StructureMetricTrainer:
                 save_path=file_path,
                 target_dim=16
             )
-            print(f"Generated {i + 1}/{num_files}: {file_name}")
+            logger.info(f"Generated {i + 1}/{num_files}: {file_name}")
 
-        print("=== Data Generation Complete. Starting Training... ===")
+        logger.info("=== Data Generation Complete. Starting Training... ===")
 
         # === Phase 2: 迭代训练 (Iterative Training) ===
         # 逻辑：每个 Epoch 都要遍历所有的文件
 
-        for epoch in range(total_epochs):
-            print(f"\n>>> Global Epoch {epoch + 1}/{total_epochs}")
+        start_epoch = 0
+        if self.resume_ckpt is not None and os.path.exists(self.resume_ckpt):
+            start_epoch = self.load_checkpoint(self.resume_ckpt)
+
+        for epoch in range(start_epoch, total_epochs):  ###当服务器训练中断，可以接着训练
+            logger.info(f"\n>>> Global Epoch {epoch + 1}/{total_epochs}")
 
             epoch_loss = 0
             file_count = 0
@@ -286,13 +323,15 @@ class StructureMetricTrainer:
                 # print(f"   Processed {os.path.basename(file_path)} | Loss: {loss:.4f}")
 
             avg_epoch_loss = epoch_loss / file_count
-            print(f"   [Epoch {epoch + 1} Summary] Avg Loss: {avg_epoch_loss:.6f}")
+            logger.info(f"   [Epoch {epoch + 1} Summary] Avg Loss: {avg_epoch_loss:.6f}")
 
             # 3. 保存 Checkpoint
             if (epoch + 1) % 5 == 0:
                 ckpt_name = f"set_encoder_epoch_{epoch + 1}.pth"
-                torch.save(self.model.state_dict(), os.path.join(self.save_path, ckpt_name))
-                print(f"   Checkpoint saved: {ckpt_name}")
+                ckpt_path = os.path.join(self.save_path, ckpt_name)
+                self.save_checkpoint(epoch, ckpt_path)
+                #torch.save(self.model.state_dict(), os.path.join(self.save_path, ckpt_name))
+                logger.info(f"   Checkpoint saved: {ckpt_name}")
 
 
 if __name__ == "__main__":
@@ -301,18 +340,21 @@ if __name__ == "__main__":
     set_encoder = SetEncoder(num_x_features=16)
 
     # 2. 选择设备 (Mac M系列)
-    device = 'cpu'
-    print(f"Training on {device}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Training on {device}")
+    resume_ckpt = None  # "../training_data/set_encoder_epoch_20.pth"  # 或 None
+
+
 
     # 3. 初始化 Trainer
-    trainer = StructureMetricTrainer(set_encoder=set_encoder, device=device)
+    trainer = StructureMetricTrainer(set_encoder=set_encoder, device=device, resume_ckpt=resume_ckpt)
 
     # 4. 开始流程
     # 假设我们生成 50 个文件，每个文件 2000 个样本 => 总共 10万数据
     # 训练 100 个 Epoch
     trainer.run_training_loop(
         generator=generator,
-        num_files=10,  # 生成 50 个不同的文件
-        cache_size=100,  # 每个文件 100 条数据
+        num_files=1000,  # 生成 50 个不同的文件
+        cache_size=1000,  # 每个文件 100 条数据
         total_epochs=100  # 总共把这 50 个文件过 100 遍
     )
