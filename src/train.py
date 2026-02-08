@@ -1,26 +1,24 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 import os
-import numpy as np
+import json
+import gc  # 引入垃圾回收模块
 from tqdm import tqdm
 
-# 假设 tokenizer 和 metrics 已经定义
+from src.set_encoder import SympfnModel, SetEncoder
 from tokenizer import FormulaTokenizer
-from metrics import FormulaDistanceMetric
 
 
-# --- 定义 Dataset (负责搬运 .pt 数据) ---
+# --- Dataset 保持不变 ---
 class SymPFNDataset(Dataset):
     def __init__(self, data_path):
-        print(f"Loading dataset from {data_path}...")
-        data = torch.load(data_path)
-        # 直接读取保存好的 Tensor (Query 和 Context 已经配对好了)
+        # print(f"Loading dataset from {data_path}...")
+        data = torch.load(data_path, map_location='cpu')  # 强制确保先加载到内存，不要直接上 GPU
         self.q_x = data['query_x']
         self.q_y = data['query_y']
         self.q_f = data['query_f']
-
         self.c_x = data['ctx_x']
         self.c_y = data['ctx_y']
         self.c_f = data['ctx_f']
@@ -30,12 +28,16 @@ class SymPFNDataset(Dataset):
 
     def __getitem__(self, idx):
         return {
-            'query_x': self.q_x[idx], 'query_y': self.q_y[idx], 'query_f': self.q_f[idx],
-            'ctx_x': self.c_x[idx], 'ctx_y': self.c_y[idx], 'ctx_f': self.c_f[idx]
+            'query_x': self.q_x[idx],
+            'query_y': self.q_y[idx],
+            'query_f': self.q_f[idx],
+            'ctx_x': self.c_x[idx],
+            'ctx_y': self.c_y[idx],
+            'ctx_f': self.c_f[idx]
         }
 
 
-# --- 补全后的 PFNTrainer ---
+# --- 优化后的 Trainer ---
 class PFNTrainer:
     def __init__(self,
                  set_encoder,
@@ -43,178 +45,283 @@ class PFNTrainer:
                  device,
                  learning_rate=1e-4,
                  weight_decay=1e-5,
-                 alpha=0.5,
+                 batch_size=256,
+                 save_path='../training_data',
                  max_variables=16,
                  max_length=103,
-                 batch_size=256,
-                 sample_num=100,
-                 save_path='../training_data'  # 这里指向存放 generated .pt 文件的目录
+                 val_ratio=0.1
                  ):
 
         self.tokenizer = FormulaTokenizer(max_variables=max_variables, max_length=max_length)
-        self.metric = FormulaDistanceMetric(self.tokenizer)
-
         self.set_encoder = set_encoder
         self.sympfn_model = sympfn_model
         self.device = device
         self.batch_size = batch_size
-        self.sample_num = sample_num
-        self.alpha = alpha
         self.save_path = save_path
+        self.val_ratio = val_ratio
+
+        self.history = {'train_loss': [], 'val_loss': []}
 
         if not os.path.exists(self.save_path):
             os.makedirs(self.save_path)
 
-        # --- Loss ---
-        # 忽略 padding token 的 loss
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_id)
 
-        # --- Optimizer ---
-        # 只优化 SymPFN，SetEncoder 保持冻结
         self.optimizer = torch.optim.AdamW(
             self.sympfn_model.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay
         )
 
-        # --- Freeze SetEncoder ---
-        print("Freezing SetEncoder parameters...")
+        # 冻结 SetEncoder
         for param in self.set_encoder.parameters():
             param.requires_grad = False
         self.set_encoder.eval()
+        self.set_encoder.to(device)
+        self.sympfn_model.to(device)
 
-    def generate_dataloader(self, file_name):
-        """
-        加载指定的 .pt 文件并返回 DataLoader
-        Args:
-            file_name: e.g., "sympfn_training_data_cycle_0.pt"
-        """
+    def generate_dataloaders(self, file_name):
         full_path = os.path.join(self.save_path, file_name)
-
         if not os.path.exists(full_path):
             raise FileNotFoundError(f"Data file not found: {full_path}")
 
-        dataset = SymPFNDataset(full_path)
+        # 使用 map_location='cpu' 防止加载数据时占用显存
+        full_dataset = SymPFNDataset(full_path)
 
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=True,  # 训练时必须打乱
-            num_workers=4,  # 多进程加速数据读取
-            pin_memory=True  # 加速 CPU -> GPU 传输
-        )
-        return dataloader
+        total_size = len(full_dataset)
+        val_size = int(total_size * self.val_ratio)
+        train_size = total_size - val_size
+
+        print(f"Splitting: Train={train_size}, Val={val_size}")
+
+        generator = torch.Generator().manual_seed(42)
+        train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
+
+        # num_workers=0 在调试显存问题时最安全
+        # pin_memory=True 加速数据传输
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=0,
+                                  pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+
+        return train_loader, val_loader
 
     def train_epoch(self, dataloader, epoch_idx):
-        """
-        训练一个 Epoch
-        """
-        self.sympfn_model.train()  # 开启 Dropout/BN 更新
-        self.set_encoder.eval()  # 保持冻结
+        self.sympfn_model.train()
+        self.set_encoder.eval()
 
         total_loss = 0
-        # 使用 tqdm 显示进度条
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch_idx} Training")
+        pbar = tqdm(dataloader, desc=f"Ep {epoch_idx} [Train]", leave=False)
 
         for batch in pbar:
-            # 1. 数据上 GPU
-            # Query (Target Task)
-            q_x = batch['query_x'].to(self.device)
-            q_y = batch['query_y'].to(self.device)
-            q_f = batch['query_f'].to(self.device)  # Shape: [B, Seq_Len]
+            # 1. 搬运数据
+            q_x = batch['query_x'].to(self.device, non_blocking=True)
+            q_y = batch['query_y'].to(self.device, non_blocking=True)
+            q_f = batch['query_f'].to(self.device, non_blocking=True)
 
-            # Context (Reference Info)
-            ctx_x = batch['ctx_x'].to(self.device)
-            ctx_y = batch['ctx_y'].to(self.device)
-            ctx_f = batch['ctx_f'].to(self.device)  # Shape: [B, Seq_Len]
+            ctx_x = batch['ctx_x'].to(self.device, non_blocking=True)
+            ctx_y = batch['ctx_y'].to(self.device, non_blocking=True)
+            ctx_f = batch['ctx_f'].to(self.device, non_blocking=True)
 
-            # 2. 计算 Context Embedding (On-the-fly)
+            # 2. 计算 Context Embedding (No Grad)
             with torch.no_grad():
-                # SetEncoder 只需要处理 Context，因为它是给 SymPFN 提供参考的
-                # 输入: [B, N, D] -> 输出: [B, D]
-                raw_emb_ctx = self.set_encoder(ctx_x, ctx_y)
+                curr_batch_size, k, n_points, n_features = ctx_x.shape
 
-                # [关键] 必须做 L2 归一化，因为 FAISS 检索时用的是归一化向量
-                # 这样 SymPFN 看到的 Embedding 幅度才是一致的
-                emb_ctx = F.normalize(raw_emb_ctx, p=2, dim=1)
+                # Flatten
+                flat_ctx_x = ctx_x.view(-1, n_points, n_features)
+                flat_ctx_y = ctx_y.view(-1, n_points, 1)
 
-                # 维度调整: SymPFN 期望 Context 是序列形式 [Batch, K, Dim]
-                # 这里我们每个 Query 只有一个 Context (Top-1)，所以 K=1
-                d_train_embs = emb_ctx.unsqueeze(1)  # [B, 1, D]
+                raw_emb_ctx = self.set_encoder(flat_ctx_x, flat_ctx_y)
+                flat_emb_ctx = F.normalize(raw_emb_ctx, p=2, dim=1)
 
-            # 3. 维度调整 Context Tokens
-            # [B, Len] -> [B, 1, Len]
-            f_train_tokens = ctx_f.unsqueeze(1)
+                d_train_embs = flat_emb_ctx.view(curr_batch_size, k, -1)
 
-            # 4. SymPFN Forward
+            # 3. Forward
             self.optimizer.zero_grad()
 
-            # 假设你的 SymPFN forward 接受以下参数
             logits = self.sympfn_model(
                 xs_test=q_x,
                 ys_test=q_y,
-                test_mask=None,  # 假设全是有效点
-                d_train_embs=d_train_embs,  # 检索到的上下文 Embedding
-                f_train_tokens=f_train_tokens,  # 检索到的上下文公式
-                f_train_mask=None,  # 假设公式无需 mask (或已 pad)
-                target_f_tokens=q_f  # 目标公式 (用于 Teacher Forcing)
+                test_mask=None,
+                d_train_embs=d_train_embs,
+                f_train_tokens=ctx_f,
+                target_f_tokens=q_f
             )
-            # logits shape: [Batch, Seq_Len - 1, Vocab_Size]
 
-            # 5. 计算 Loss (Shifted Targets)
-            # 目标是预测下一个 token
-            # 如果 q_f 是 [SOS, A, B, EOS, PAD]
-            # targets 应该是 [A, B, EOS, PAD, PAD] (即 q_f[:, 1:])
-            # logits 对应预测这些位置
-
-            vocab_size = logits.shape[-1]
+            # 4. Loss
             targets = q_f[:, 1:].contiguous().view(-1)
-            predictions = logits.view(-1, vocab_size)
-
+            predictions = logits.view(-1, logits.shape[-1])
             loss = self.ce_loss(predictions, targets)
 
-            # 6. Backward
+            # 5. Backward
             loss.backward()
-
-            # 梯度裁剪 (防止 Transformer 训练不稳定)
             torch.nn.utils.clip_grad_norm_(self.sympfn_model.parameters(), max_norm=1.0)
-
             self.optimizer.step()
 
             total_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
+            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+
+            # [关键修改] 手动删除变量，释放计算图
+            del loss, logits, predictions, targets, q_x, q_y, q_f, ctx_x, ctx_y, ctx_f, d_train_embs
+
+        # Epoch 结束清理缓存
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
 
         return total_loss / len(dataloader)
 
+    def validate_epoch(self, dataloader, epoch_idx):
+        self.sympfn_model.eval()
+        self.set_encoder.eval()
+
+        total_loss = 0
+        pbar = tqdm(dataloader, desc=f"Ep {epoch_idx} [Val]  ", leave=False)
+
+        # 验证前先清理一下，确保 Training 留下的垃圾被收走
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+
+        with torch.no_grad():
+            for batch in pbar:
+                # 数据上 GPU
+                q_x = batch['query_x'].to(self.device, non_blocking=True)
+                q_y = batch['query_y'].to(self.device, non_blocking=True)
+                q_f = batch['query_f'].to(self.device, non_blocking=True)
+
+                ctx_x = batch['ctx_x'].to(self.device, non_blocking=True)
+                ctx_y = batch['ctx_y'].to(self.device, non_blocking=True)
+                ctx_f = batch['ctx_f'].to(self.device, non_blocking=True)
+
+                # Context Logic
+                curr_batch_size, k, n_points, n_features = ctx_x.shape
+                flat_ctx_x = ctx_x.view(-1, n_points, n_features)
+                flat_ctx_y = ctx_y.view(-1, n_points, 1)
+
+                raw_emb_ctx = self.set_encoder(flat_ctx_x, flat_ctx_y)
+                flat_emb_ctx = F.normalize(raw_emb_ctx, p=2, dim=1)
+                d_train_embs = flat_emb_ctx.view(curr_batch_size, k, -1)
+
+                # Forward
+                logits = self.sympfn_model(
+                    xs_test=q_x,
+                    ys_test=q_y,
+                    test_mask=None,
+                    d_train_embs=d_train_embs,
+                    f_train_tokens=ctx_f,
+                    target_f_tokens=q_f
+                )
+
+                targets = q_f[:, 1:].contiguous().view(-1)
+                predictions = logits.view(-1, logits.shape[-1])
+
+                # 这里的 loss 是一个标量 Tensor
+                loss = self.ce_loss(predictions, targets)
+
+                total_loss += loss.item()
+                pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+
+                # 手动删除
+                del loss, logits, predictions, targets, q_x, q_y, q_f, ctx_x, ctx_y, ctx_f, d_train_embs
+
+        # 验证结束后再次清理
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+
+        return total_loss / len(dataloader)
+
+    def save_logs(self):
+        log_path = os.path.join(self.save_path, "training_logs.json")
+        try:
+            with open(log_path, 'w') as f:
+                json.dump(self.history, f, indent=4)
+        except Exception as e:
+            print(f"Warning: Failed to save logs: {e}")
+
     def run_training_loop(self, train_files, epochs_per_file=1):
-        """
-        主训练循环
-        Args:
-            train_files: List[str]，例如 ["cycle_0.pt", "cycle_1.pt"]
-            epochs_per_file: 每个文件训练多少轮 (通常 1 轮即可，因为数据量很大且不重复)
-        """
-        print(f"Start SymPFN Training on {len(train_files)} dataset files.")
+        print(f"Start SymPFN Training on {len(train_files)} files.")
 
         for file_idx, file_name in enumerate(train_files):
-            print(f"\n=== Processing File {file_idx + 1}/{len(train_files)}: {file_name} ===")
+            print(f"\n=== Processing {file_name} ({file_idx + 1}/{len(train_files)}) ===")
 
-            # 1. 加载数据
+            # 清理之前的 DataLoader 残留
+            if self.device == 'cuda':
+                torch.cuda.empty_cache()
+            gc.collect()
+
             try:
-                dataloader = self.generate_dataloader(file_name)
+                train_loader, val_loader = self.generate_dataloaders(file_name)
             except FileNotFoundError as e:
                 print(e)
                 continue
 
-            # 2. 训练 Epochs
             for epoch in range(epochs_per_file):
-                avg_loss = self.train_epoch(dataloader, epoch_idx=epoch)
-                print(f"   [File {file_name} - Epoch {epoch}] Avg Loss: {avg_loss:.6f}")
+                # 训练
+                train_loss = self.train_epoch(train_loader, epoch_idx=epoch)
 
-            # 3. 每个 File 训练完后保存 Checkpoint
-            # 这样如果训练中断，可以从下一个 File 继续
-            ckpt_name = f"sympfn_checkpoint_file_{file_idx}.pth"
-            save_full_path = os.path.join(self.save_path, ckpt_name)
-            torch.save(self.sympfn_model.state_dict(), save_full_path)
-            print(f"   Saved checkpoint to {ckpt_name}")
+                # 验证
+                val_loss = self.validate_epoch(val_loader, epoch_idx=epoch)
 
-        print("All training completed.")
+                self.history['train_loss'].append(train_loss)
+                self.history['val_loss'].append(val_loss)
+
+                print(f"   [Epoch {epoch}] Train Loss: {train_loss:.5f} | Val Loss: {val_loss:.5f}")
+
+            # 保存模型
+            ckpt_name = f"sympfn_epoch_{file_idx}.pth"
+            torch.save(self.sympfn_model.state_dict(), os.path.join(self.save_path, ckpt_name))
+            self.save_logs()
+
+            # 文件切换时，彻底删除 loader，防止内存泄漏
+            del train_loader, val_loader
+            gc.collect()
+
+
+if __name__ == "__main__":
+    # --- 1. 配置 ---
+    device = 'cpu'
+
+    print(f"Using Device: {device}")
+
+    # --- 2. SetEncoder ---
+    set_encoder = SetEncoder(num_x_features=16)
+    checkpoint_path = "../training_data/set_encoder_epoch_10.pth"
+
+    if os.path.exists(checkpoint_path):
+        state_dict = torch.load(checkpoint_path, map_location='cpu')
+        try:
+            set_encoder.load_state_dict(state_dict)
+            print("SetEncoder weights loaded.")
+        except RuntimeError as e:
+            print(f"Weight loading error: {e}")
+    else:
+        print("Warning: SetEncoder weights not found.")
+
+    set_encoder.to(device)
+    set_encoder.eval()
+
+    # --- 3. SympfnModel ---
+    sympfn_model = SympfnModel(
+        set_encoder=set_encoder,
+        vocab_size=103
+    )
+    sympfn_model.to(device)
+
+    # --- 4. Trainer ---
+    training_data_path = "../training_data/sympfn_top10_data.pt"
+    data_dir = os.path.dirname(training_data_path)
+    data_filename = os.path.basename(training_data_path)
+
+    trainer = PFNTrainer(
+        set_encoder=set_encoder,
+        sympfn_model=sympfn_model,
+        device=device,
+        batch_size=16,
+        learning_rate=1e-4,
+        save_path=data_dir,
+        val_ratio=0.1  # 使用 10% 的数据作为验证集
+    )
+
+    # --- 5. Start ---
+    trainer.run_training_loop(
+        train_files=[data_filename],
+        epochs_per_file=50
+    )

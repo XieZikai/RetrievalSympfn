@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pandas.io.stata import excessive_string_length_error
 
-from src.generator import Generator
-from src.set_encoder import SetEncoder
+from generator import Generator
+from set_encoder import SetEncoder
 from tokenizer import FormulaTokenizer
 from metrics import FormulaDistanceMetric
 

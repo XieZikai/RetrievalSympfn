@@ -1,6 +1,6 @@
 torch
 numpy
-faiss
+faiss-cpu
 scipy
 Levenshtein
 tqdm
