@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=run_train1    # 作业名，方便识别
-#SBATCH --output=/fs0/home/zikaix/Data/zikaix/logs/slurm-sympfn-train1-%j.out         # 标准输出日志
-#SBATCH --error=/fs0/home/zikaix/Data/zikaix/logs/slurm-sympfn-train1-%j.err          # 错误输出日志
+#SBATCH --output=/fs0/home/zikaix/Data/zikaix/RetrievalSympfn/logs/slurm-sympfn-train1-%j.out         # 标准输出日志
+#SBATCH --error=/fs0/home/zikaix/Data/zikaix/RetrievalSympfn/logs/slurm-sympfn-train1-%j.err          # 错误输出日志
 #SBATCH --nodes=1                   # 用1个节点（单节点足够）
 #SBATCH --ntasks-per-node=1         # 单个节点只跑1个任务（代码未并行，多任务会冲突）
 #SBATCH --gres=gpu:1

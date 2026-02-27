@@ -5,8 +5,8 @@
 #SBATCH --gres=gpu:4                  # 申请的 GPU 数量 (假设这里用 4 张卡)
 #SBATCH --cpus-per-task=16            # CPU 核心数 (推荐 = GPU数 * 4)
 #SBATCH --partition=a800
-#SBATCH --output=/fs0/home/zikaix/Data/zikaix/logs/slurm-sympfn-ddp-%j.out         # 标准输出日志
-#SBATCH --error=/fs0/home/zikaix/Data/zikaix/logs/slurm-sympfn-ddp-%j.err          # 错误输出日志
+#SBATCH --output=/fs0/home/zikaix/Data/zikaix/RetrievalSympfn/logs/slurm-sympfn-ddp-%j.out         # 标准输出日志
+#SBATCH --error=/fs0/home/zikaix/Data/zikaix/RetrievalSympfn/logs/slurm-sympfn-ddp-%j.err          # 错误输出日志
 #SBATCH --time=2:00:00               # 限制运行时间
 
 # 1. 激活你的虚拟环境 (替换为你实际的 conda 环境或 venv)
