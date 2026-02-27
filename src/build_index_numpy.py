@@ -178,14 +178,15 @@ if __name__ == "__main__":
 
     # 加载权重 (省略部分与之前相同...)
     # 假设你已经加载好了权重
+    output_dir = '/fs0/home/zikaix/Data/zikaix/RetrievalSympfn/training_data1'
 
-    data_path_list = [os.path.join('/fs0/home/zikaix/symbolicregressionTabPFN/RetrievalSympfn/training_data/pregenerated_data', f)
-                      for f in os.listdir('/fs0/home/zikaix/symbolicregressionTabPFN/RetrievalSympfn/training_data/pregenerated_data') if f.endswith('.pt')]
+    data_path_list = [os.path.join(output_dir, 'pregenerated_data', f)
+                      for f in os.listdir(os.path.join(output_dir, 'pregenerated_data')) if f.endswith('.pt')]
 
     build_database_and_generate_data_topk(
         data_path_list,
         set_encoder,
-        output_dir='/fs0/home/zikaix/symbolicregressionTabPFN/RetrievalSympfn/training_data1',
+        output_dir=output_dir,
         device=device,
         batch_size=256,
         k=20,  # 你要求的 10 个 context

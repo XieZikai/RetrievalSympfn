@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pandas.io.stata import excessive_string_length_error
+from setuptools.sandbox import save_path
 
 from generator import Generator
 from set_encoder import SetEncoder
@@ -338,16 +339,15 @@ if __name__ == "__main__":
     # 1. 初始化
     generator = Generator()  # 你的生成器已经包含了 RandomState 的修复
     set_encoder = SetEncoder(num_x_features=16)
+    output_dir = '/fs0/home/zikaix/Data/zikaix/RetrievalSympfn/training_data'
 
     # 2. 选择设备 (Mac M系列)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Training on {device}")
-    resume_ckpt = "/fs0/home/zikaix/symbolicregressionTabPFN/RetrievalSympfn/training_data/set_encoder_epoch_90.pth"  #None  # "../training_data/set_encoder_epoch_20.pth"  # 或 None
-
-
+    resume_ckpt = os.path.join(output_dir, "set_encoder_epoch_90.pth")  #None  # "../training_data/set_encoder_epoch_20.pth"  # 或 None
 
     # 3. 初始化 Trainer
-    trainer = StructureMetricTrainer(set_encoder=set_encoder, device=device, resume_ckpt=resume_ckpt)
+    trainer = StructureMetricTrainer(set_encoder=set_encoder, device=device, resume_ckpt=resume_ckpt, save_path=output_dir)
 
     # 4. 开始流程
     # 假设我们生成 50 个文件，每个文件 2000 个样本 => 总共 10万数据
@@ -356,5 +356,5 @@ if __name__ == "__main__":
         generator=generator,
         num_files=1000,  # 生成 50 个不同的文件
         cache_size=1000,  # 每个文件 100 条数据
-        total_epochs=100  # 总共把这 50 个文件过 100 遍
+        total_epochs=100,  # 总共把这 50 个文件过 100 遍
     )

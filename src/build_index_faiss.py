@@ -187,9 +187,11 @@ def build_database_and_generate_data(
 if __name__ == "__main__":
     from set_encoder import SetEncoder
 
+    output_dir = '/fs0/home/zikaix/Data/zikaix/RetrievalSympfn/training_data'
+
     set_encoder = SetEncoder(num_x_features=16)
     device = 'cpu'
-    checkpoint_path = "../training_data/set_encoder_epoch_10.pth"
+    checkpoint_path = os.path.join(output_dir, "set_encoder_epoch_10.pth")
     state_dict = torch.load(checkpoint_path, map_location='cpu')
     # 4. 将权重注入模型
     try:
@@ -203,13 +205,13 @@ if __name__ == "__main__":
     set_encoder.to(device)
     set_encoder.eval()
 
-    data_list = os.listdir('../training_data/pregenerated_data')
+    data_list = os.listdir(os.path.join(output_dir, 'pregenerated_data'))
     data_path_list = [
-        os.path.join('../training_data/pregenerated_data', data)
+        os.path.join(output_dir, 'pregenerated_data', data)
         for data in data_list
         if data.endswith('.pt')  # [建议] 只读取 .pt 文件
     ]
-    output_dir = '../training_data'
+
 
     build_database_and_generate_data(
         data_path_list,  # 本地 .pt 文件列表

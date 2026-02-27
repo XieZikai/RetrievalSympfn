@@ -295,7 +295,8 @@ if __name__ == "__main__":
 
     # --- 2. SetEncoder ---
     set_encoder = SetEncoder(num_x_features=16)
-    checkpoint_path = "/fs0/home/zikaix/symbolicregressionTabPFN/RetrievalSympfn/training_data/set_encoder_epoch_100.pth"
+    output_dir = '~/Data/zikaix/RetrievalSympfn/training_data'
+    checkpoint_path = os.path.join(output_dir, "set_encoder_epoch_100.pth")
 
     if os.path.exists(checkpoint_path):
         ##############修改，读取checkpoion###########################
@@ -324,7 +325,8 @@ if __name__ == "__main__":
     sympfn_model.to(device)
 
     # --- 4. Trainer ---
-    training_data_path = "/fs0/home/zikaix/symbolicregressionTabPFN/RetrievalSympfn/training_data1/sympfn_top20_data.pt"
+    output_dir = '/fs0/home/zikaix/Data/zikaix/RetrievalSympfn/training_data1'
+    training_data_path = os.path.join(output_dir, "sympfn_top20_data.pt")
     data_dir = os.path.dirname(training_data_path)
     data_filename = os.path.basename(training_data_path)
 
