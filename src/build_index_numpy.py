@@ -4,7 +4,17 @@ import os
 import numpy as np
 from tqdm import tqdm
 from torch.utils.data import DataLoader, TensorDataset
+import logging  # <--- 1. 导入
+from logging import getLogger
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.FileHandler("build_index_numpy.log", mode="w"),
+        logging.StreamHandler()
+    ])
+logger = getLogger(__name__)
 
 def build_database_and_generate_data_topk(
         data_path_list,
@@ -23,7 +33,7 @@ def build_database_and_generate_data_topk(
         os.makedirs(output_dir)
 
     # --- 1. Loading and Merging Data ---
-    print(">>> 1. Loading and Merging Data...")
+    logger.info(">>> 1. Loading and Merging Data...")
     all_x, all_y, all_f_tokens = [], [], []
 
     for p in tqdm(data_path_list, desc="Loading"):
@@ -37,10 +47,10 @@ def build_database_and_generate_data_topk(
     full_f = torch.cat(all_f_tokens, dim=0).long()
 
     total_samples = full_x.shape[0]
-    print(f"Total samples: {total_samples}")
+    logger.info(f"Total samples: {total_samples}")
 
     # --- 2. Computing Embeddings ---
-    print(">>> 2. Computing Embeddings...")
+    logger.info(">>> 2. Computing Embeddings...")
     dataset = TensorDataset(full_x, full_y)
     # Mac M系列芯片建议 num_workers=0
     num_workers = 0 if device == 'mps' else 4
@@ -56,9 +66,10 @@ def build_database_and_generate_data_topk(
             raw_emb = set_encoder(bx, by)
             # L2 归一化，保证矩阵乘法等价于余弦相似度
             emb = F.normalize(raw_emb, p=2, dim=1)
-            embeddings_list.append(emb)  # 保持在 GPU/MPS 上
+            #embeddings_list.append(emb)  # 保持在 GPU/MPS 上
+            embeddings_list.append(emb)  # #######################################⭐ 立刻搬回 CPU
 
-    all_embeddings = torch.cat(embeddings_list, dim=0)  # [Total, Dim]
+    all_embeddings = torch.cat(embeddings_list, dim=0).to(device)  # [Total, Dim]
 
     # --- 3. Retrieval (Matrix Multiplication) ---
     # 我们需要检索 k+1 个邻居。
@@ -66,7 +77,7 @@ def build_database_and_generate_data_topk(
     # 如果我们要“排除自己”，就需要取 [1:k+1]
     search_k = k + 1
 
-    print(f">>> 3. Retrieving Top-{k} Contexts (Search Window={search_k})...")
+    logger.info(f">>> 3. Retrieving Top-{k} Contexts (Search Window={search_k})...")
 
     all_context_indices = []
     num_batches = (total_samples + batch_size - 1) // batch_size
@@ -112,7 +123,7 @@ def build_database_and_generate_data_topk(
     final_ctx_ids = torch.cat(all_context_indices, dim=0).long()
 
     # --- 5. Assembling Dataset ---
-    print(">>> 5. Assembling Dataset with [Batch, k, Features] shape...")
+    logger.info(">>> 5. Assembling Dataset with [Batch, k, Features] shape...")
 
     # PyTorch 的高级索引会自动处理额外的维度
     # final_ctx_ids 是 [N, k]
@@ -145,11 +156,11 @@ def build_database_and_generate_data_topk(
     }
     torch.save(metadata, os.path.join(output_dir, "metadata_db.pt"))
 
-    print(f"Done! Saved to {save_path}")
-    print(f"Shape Check:")
-    print(f"  Query X: {full_x.shape}")  # [N, X_Feat]
-    print(f"  Context X: {ctx_x.shape}")  # [N, k, X_Feat]
-    print(f"  Context F: {ctx_f.shape}")  # [N, k, Seq_Len]
+    logger.info(f"Done! Saved to {save_path}")
+    logger.info(f"Shape Check:")
+    logger.info(f"  Query X: {full_x.shape}")  # [N, X_Feat]
+    logger.info(f"  Context X: {ctx_x.shape}")  # [N, k, X_Feat]
+    logger.info(f"  Context F: {ctx_f.shape}")  # [N, k, Seq_Len]
 
 
 if __name__ == "__main__":
@@ -168,15 +179,15 @@ if __name__ == "__main__":
     # 加载权重 (省略部分与之前相同...)
     # 假设你已经加载好了权重
 
-    data_path_list = [os.path.join('../training_data/pregenerated_data', f)
-                      for f in os.listdir('../training_data/pregenerated_data') if f.endswith('.pt')]
+    data_path_list = [os.path.join('/fs0/home/zikaix/symbolicregressionTabPFN/RetrievalSympfn/training_data/pregenerated_data', f)
+                      for f in os.listdir('/fs0/home/zikaix/symbolicregressionTabPFN/RetrievalSympfn/training_data/pregenerated_data') if f.endswith('.pt')]
 
     build_database_and_generate_data_topk(
         data_path_list,
         set_encoder,
-        output_dir='../training_data',
+        output_dir='/fs0/home/zikaix/symbolicregressionTabPFN/RetrievalSympfn/training_data1',
         device=device,
         batch_size=256,
-        k=10,  # 你要求的 10 个 context
+        k=20,  # 你要求的 10 个 context
         include_self_prob=0.1  # 50% 概率包含自己
     )

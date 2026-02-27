@@ -18,7 +18,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     handlers=[
-        logging.FileHandler("train.log", mode="w"),
+        logging.FileHandler("train1.log", mode="w"),
         logging.StreamHandler()
     ])
 logger = getLogger(__name__)
@@ -324,7 +324,7 @@ if __name__ == "__main__":
     sympfn_model.to(device)
 
     # --- 4. Trainer ---
-    training_data_path = "/fs0/home/zikaix/symbolicregressionTabPFN/RetrievalSympfn/training_data/sympfn_top10_data.pt"
+    training_data_path = "/fs0/home/zikaix/symbolicregressionTabPFN/RetrievalSympfn/training_data1/sympfn_top20_data.pt"
     data_dir = os.path.dirname(training_data_path)
     data_filename = os.path.basename(training_data_path)
 

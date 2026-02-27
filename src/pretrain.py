@@ -342,7 +342,7 @@ if __name__ == "__main__":
     # 2. 选择设备 (Mac M系列)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Training on {device}")
-    resume_ckpt = None  # "../training_data/set_encoder_epoch_20.pth"  # 或 None
+    resume_ckpt = "/fs0/home/zikaix/symbolicregressionTabPFN/RetrievalSympfn/training_data/set_encoder_epoch_90.pth"  #None  # "../training_data/set_encoder_epoch_20.pth"  # 或 None
 
 
 
