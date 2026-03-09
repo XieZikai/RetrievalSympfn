@@ -265,6 +265,13 @@ class SympfnModel(nn.Module):
             param.requires_grad = False
         self.set_encoder.eval()  # 设为验证模式 (关闭 Dropout/BN 更新)
 
+        set_encoder_dim = set_encoder.ninp
+        self.context_adapter = nn.Sequential(
+            nn.Linear(set_encoder_dim, set_encoder_dim),
+            nn.GELU(),
+            nn.Linear(set_encoder_dim, set_encoder_dim)
+        )
+
         # --- 2. Formula Encoder (用于处理 Context 中的 f_train) ---
         # 注意：这里我们复用你定义的 FormulaEncoder 逻辑，但可能不需要 pooling
         # 为了简单，我们这里假设 f_train 已经被压缩成了 (Batch, 512) 的向量
@@ -334,6 +341,8 @@ class SympfnModel(nn.Module):
             # q_emb: (Batch, 512) -> (Batch, 1, 512)
             q_emb = self.set_encoder(xs_test, ys_test, src_key_padding_mask=test_mask).unsqueeze(1)
 
+        adapted_context = self.context_adapter(d_train_embs)
+
         # 2. 编码 Context Formula
         # 我们需要把 (Batch, K, Len) 的 token 变成 (Batch, K, 512) 的向量
         # 这是一个大的 Batch 处理
@@ -348,7 +357,7 @@ class SympfnModel(nn.Module):
 
         # 3. 构造 Meta Sequence
         # Context: [d1, f1, d2, f2...]
-        context_seq = self._interleave(d_train_embs, f_emb)  # (Batch, 2*K, 512)
+        context_seq = self._interleave(adapted_context, f_emb)  # (Batch, 2*K, 512)
 
         # Full Sequence: [Context, Query]
         # encoder_input: (Batch, 2*K + 1, 512)

@@ -357,8 +357,8 @@ class PFNTrainer:
                     self.history['train_loss'].append(train_loss)
                     self.history['val_loss'].append(val_loss)
                     logger.info(f"   [Epoch {epoch}] Train Loss: {train_loss:.5f} | Val Loss: {val_loss:.5f}")
-                    
-                    # [新增] 保存最新的全局 Checkpoint 字典
+
+                    # 1. 始终保存最新的全局 Checkpoint（防止突发中断）
                     latest_ckpt_path = os.path.join(self.save_path, "latest_sympfn_checkpoint.pth")
                     checkpoint_dict = {
                         'model_state_dict': self.sympfn_model.module.state_dict(),
@@ -368,6 +368,14 @@ class PFNTrainer:
                         'history': self.history
                     }
                     torch.save(checkpoint_dict, latest_ckpt_path)
+
+                    # 2. [新增] 每 10 个 Epoch 额外存档一份历史快照
+                    if (epoch + 1) % 10 == 0:
+                        archive_ckpt_name = f"sympfn_checkpoint_file_{file_idx}_epoch{epoch + 1}.pth"
+                        archive_ckpt_path = os.path.join(self.save_path, archive_ckpt_name)
+                        # 直接把字典再保存一份，作为历史节点
+                        torch.save(checkpoint_dict, archive_ckpt_path)
+                        logger.info(f"   [Checkpoint] Archived historical model to {archive_ckpt_name}")
 
                     # 保存 loss 记录到 JSON
                     log_path = os.path.join(self.save_path, "training_logs.json")
